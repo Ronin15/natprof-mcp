@@ -44,7 +44,7 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("natprof")
+mcp = FastMCP("natprof", instructions=__doc__)
 
 SYSTEM_PREFIXES = ("/usr/lib/", "/System/", "/Library/Apple/")
 SENTINEL = "<<<NATPROF_EOC>>>"
