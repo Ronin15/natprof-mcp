@@ -63,8 +63,11 @@ python3 -m venv .venv
 
 ## Register with Claude Code
 
+Run from inside the `natprof-mcp` directory (`claude mcp add` needs an
+absolute path to the interpreter/entry point):
+
 ```sh
-claude mcp add natprof -- /Users/roninxv/projects/natprof-mcp/.venv/bin/natprof-mcp
+claude mcp add natprof -- "$(pwd)/.venv/bin/natprof-mcp"
 ```
 
 (Or point it at `.venv/bin/python -m natprof_mcp.server` if you'd rather not
