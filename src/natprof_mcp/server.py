@@ -7,8 +7,9 @@ The agent never touches paths, slides, ports, or `protocol-server`.
 Profiling is built on /usr/bin/sample, not xctrace — it ships with the
 Command Line Tools (no full Xcode.app required) and, unlike an LLDB
 `process interrupt`, never holds the whole process suspended: it briefly
-thread_suspends one thread at a time to read its stack, so audio/render
-threads keep running between samples instead of glitching.
+thread_suspends one thread at a time to read its stack, so latency-sensitive
+threads (audio callbacks, a render loop, network I/O) keep running between
+samples instead of stalling.
 
 Correctness model — symbols are either right or the call fails:
   * Images are SNAPSHOT at open_session. Symbolication reads the frozen copy,
@@ -163,9 +164,9 @@ class Lldb:
         # stderr shares this same pty with lldb's control channel — every
         # command after launch gets flooded with interleaved child output,
         # confirmed live (a "process kill" response came back as a wall of
-        # the game's own debug logs instead of a kill confirmation, and the
-        # process was still alive afterward because the actual kill command
-        # got lost in that noise).
+        # the target's own stdout/stderr instead of a kill confirmation, and
+        # the process was still alive afterward because the actual kill
+        # command got lost in that noise).
         flags = ["-m", "-n"]
         if cwd:
             flags += ["-w", shlex.quote(cwd)]
@@ -629,8 +630,9 @@ def launch_session(path: str, args: Optional[list[str]] = None,
     attach_debugger defaulting off.
 
     cwd defaults to wherever this server process itself runs from; pass it
-    explicitly for targets that resolve asset paths relative to their own
-    launch directory (e.g. a game reading "assets/..." relative to its bin dir).
+    explicitly for targets that resolve relative paths (config files, data
+    directories, etc.) against their own launch directory rather than an
+    absolute path.
 
     path/args/env values may not contain a newline or carriage return.
 
@@ -688,11 +690,12 @@ def backtrace_all(session_id: str) -> str:
     """Interrupt, dump every thread's backtrace, resume.
 
     This fully halts the process (LLDB `process interrupt` is a whole-process
-    task_suspend) for as long as the dump takes, which pops audio and drops
-    frames on anything real-time. For a much lower-impact "what's every
-    thread doing right now" snapshot, use light_backtrace() instead — reach
-    for this one only when you need actual LLDB commands (expr, breakpoints,
-    frame variable) on top of the stacks."""
+    task_suspend) for as long as the dump takes, which is disruptive to
+    anything latency-sensitive — audio glitches, dropped frames, timed-out
+    connections. For a much lower-impact "what's every thread doing right
+    now" snapshot, use light_backtrace() instead — reach for this one only
+    when you need actual LLDB commands (expr, breakpoints, frame variable)
+    on top of the stacks."""
     s = _sess(session_id)
     lldb = _ensure_lldb(s)
     lldb.cmd("process interrupt")
@@ -707,8 +710,9 @@ def light_backtrace(session_id: str, seconds: int = 1) -> dict:
     """Low-impact "what's every thread doing" snapshot via `sample`, instead
     of an LLDB `process interrupt`. The process is never fully halted —
     `sample` suspends one thread at a time just long enough to read its
-    stack — so this is safe to run against audio/render-sensitive processes
-    where backtrace_all would glitch.
+    stack — so this is safe to run against latency-sensitive processes
+    (audio, rendering, networking) where backtrace_all would cause a visible
+    stall.
 
     Trade-off: it's not a single instant — it's the dominant (most-sampled)
     call path per thread over `seconds`, so a thread doing several different
@@ -770,9 +774,9 @@ def record(session_id: str, seconds: int = 10, interval_ms: int = 1) -> dict:
 
     No Xcode required, and unlike an LLDB `process interrupt` the target is
     never fully halted — `sample` briefly suspends one thread at a time to
-    read its stack, so audio/render threads keep running between samples.
-    Auto-resumes the process first if LLDB has it stopped, since a halted
-    process yields zero samples."""
+    read its stack, so latency-sensitive threads keep running between
+    samples. Auto-resumes the process first if LLDB has it stopped, since a
+    halted process yields zero samples."""
     s = _sess(session_id)
     if not shutil.which("sample"):
         raise RuntimeError(_sample_missing_hint())
@@ -955,13 +959,15 @@ def close_session(session_id: str, kill: bool = False) -> dict:
     """Detach LLDB, delete snapshots and trace, drop the session.
 
     Does NOT kill the process by default, even for a launch_session-created
-    session: an LLDB-level kill (or SIGKILL) tears down CoreAudio's
-    connection with zero chance for the app's own cleanup to run, and pops
-    audio — confirmed live, this is why a plain detach never pops but a kill
-    does. Left running, you can quit it normally yourself (its own
-    quit/escape path shuts audio down cleanly, no pop). Pass kill=True to
-    force it anyway — e.g. tearing down an automated test run where nobody's
-    listening — and accept that cost."""
+    session: an LLDB-level kill (or SIGKILL) gives the target zero chance to
+    run its own cleanup — closing files, releasing devices, flushing state —
+    which can be visibly abrupt for anything holding a live resource (e.g. a
+    process with an open audio output stream will audibly pop). A plain
+    detach leaves that cleanup path intact; a kill doesn't. Left running,
+    you can quit the target normally yourself and let its own shutdown path
+    run. Pass kill=True to force it anyway — e.g. tearing down an automated
+    test run where nobody's watching for a clean exit — and accept that
+    cost."""
     s = SESSIONS.pop(session_id, None)
     if not s:
         return {"closed": None}

@@ -10,12 +10,13 @@ Works against any Mach-O + DWARF binary: C, C++, Rust, Swift, Go, Zig.
 ## How profiling works
 
 `record`/`hotspots`/`light_backtrace` sample each thread's stack by briefly
-suspending it one at a time, rather than freezing the whole process — audio
-and render threads keep running between samples instead of glitching. This
-is different from `backtrace_all`, which uses LLDB's `process interrupt` and
-does freeze everything for as long as the dump takes; reach for that one
-only when you need real LLDB commands (breakpoints, `expr`, `frame
-variable`) alongside the stacks.
+suspending it one at a time, rather than freezing the whole process — any
+latency-sensitive threads (audio callbacks, a render loop, network I/O)
+keep running between samples instead of stalling. This is different from
+`backtrace_all`, which uses LLDB's `process interrupt` and does freeze
+everything for as long as the dump takes; reach for that one only when you
+need real LLDB commands (breakpoints, `expr`, `frame variable`) alongside
+the stacks.
 
 `record()` doesn't block for its `seconds` duration — MCP tool calls are
 otherwise synchronous, so a caller with no way to background one would sit
@@ -99,7 +100,7 @@ front.
 | `set_baseline(session_id)` / `compare(session_id, threshold_pct=1.0)` | Snapshot hotspots, then diff a later run against it. |
 | `leaks(session_id)` | Run `leaks --list` against the pid. |
 | `verify(session_id)` | Re-check every snapshot's UUID and dSYM match. |
-| `close_session(session_id, kill=False)` | Tear down the session. Doesn't kill the process by default — a kill tears down CoreAudio's connection abruptly and pops audio, so the process is just left running (detached) unless you pass `kill=True`. |
+| `close_session(session_id, kill=False)` | Tear down the session. Doesn't kill the process by default — a hard kill skips the target's own graceful-shutdown path (flushing state, closing devices/connections cleanly), so the process is just left running (detached) unless you pass `kill=True`. |
 
 ## Leak backtraces
 
