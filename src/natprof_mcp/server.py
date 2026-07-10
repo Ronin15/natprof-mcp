@@ -574,7 +574,11 @@ def open_session(pid: int, dsym_paths: Optional[list[str]] = None,
     backtrace_all() attach lazily on first use; pass attach_debugger=True
     here only if you specifically want it up front.
 
-    dsym_paths are matched to images by UUID, not filename."""
+    dsym_paths are matched to images by UUID, not filename.
+
+    Returns {session_id, pid, images_total, images_snapshotted, app_images:
+    [{name, uuid, load_address, dsym} for up to the first 12 non-system
+    images], warnings, debugger}."""
     sid = _uuidmod.uuid4().hex[:8]
     raw = _vmmap_images(pid)
     images, warnings = _snapshot(sid, raw, dsym_paths or [])
@@ -631,7 +635,11 @@ def launch_session(path: str, args: Optional[list[str]] = None,
     path/args/env values may not contain a newline or carriage return.
 
     close_session() on a launch_session-created session kills the process
-    (it's ours to clean up); on an open_session-created one it only detaches."""
+    (it's ours to clean up); on an open_session-created one it only detaches.
+
+    Returns the same shape as open_session, plus {mem_debug, stopped_at_entry,
+    launch_path}; `debugger` is always "attached (launched)" since this tool
+    always launches under LLDB."""
     p = str(Path(path).expanduser())
     if not Path(p).is_file():
         raise ValueError(f"{p} does not exist or is not a file")
@@ -705,7 +713,11 @@ def light_backtrace(session_id: str, seconds: int = 1) -> dict:
     Trade-off: it's not a single instant — it's the dominant (most-sampled)
     call path per thread over `seconds`, so a thread doing several different
     things in that window collapses to whichever path won most samples.
-    `weight`/`total` on each thread tells you how dominant that path was."""
+    `weight`/`total` on each thread tells you how dominant that path was.
+
+    Returns {seconds, threads: [{frames: [{symbol, image}] (root to leaf),
+    weight, total_samples}]}. weight/total_samples is that thread's
+    dominant-path share for this window."""
     s = _sess(session_id)
     if not shutil.which("sample"):
         raise RuntimeError(_sample_missing_hint())
@@ -782,8 +794,11 @@ def record(session_id: str, seconds: int = 10, interval_ms: int = 1) -> dict:
 @mcp.tool()
 def record_status(session_id: str) -> dict:
     """Check on a record() that was started in the background. Returns
-    status "running" while `sample` is still collecting, or "done" once the
-    trace is ready for hotspots()."""
+    {status: "running"} while `sample` is still collecting, or {status:
+    "done", report} once the trace is ready for hotspots() — report is the
+    path to the raw `sample` output, not a parsed result; hotspots() is what
+    actually reads it. Raises ValueError if record() was never called on
+    this session, and RuntimeError if `sample` itself exited non-zero."""
     s = _sess(session_id)
     if s.recording_proc is None:
         if s.trace:
@@ -796,9 +811,21 @@ def record_status(session_id: str) -> dict:
 
 @mcp.tool()
 def hotspots(session_id: str, top_n: int = 20, include_system: bool = False) -> dict:
-    """Symbolicated self-time hotspots. System frames excluded by default — they
-    dominate leaf counts and say nothing. Symbols are UUID-verified or the call
-    fails; there is no stale-symbol path."""
+    """Symbolicated self-time hotspots from the last completed record(). System
+    frames excluded by default — they dominate leaf counts and say nothing.
+    Symbols are UUID-verified or the call fails; there is no stale-symbol path.
+
+    `pct` on each hotspot is always computed against `total_samples` (every
+    sample in the recording, system included), never against
+    `attributed_samples` (what's left after the include_system filter) — so
+    with include_system=False, percentages will look small whenever system
+    code dominates the recording, even if the listed hotspots are 100% of
+    your app's own time. Compare attributed_samples/total_samples to see how
+    much of the recording was system overhead versus app code before reading
+    individual pct values as "how hot is this".
+
+    Returns {total_samples, attributed_samples, hotspots: [{symbol, image,
+    samples, pct}]}."""
     s = _sess(session_id)
     if s.recording_proc is not None and not _collect_recording(s):
         raise ValueError("recording still in progress. Call record_status() "
@@ -819,7 +846,18 @@ def hotspots(session_id: str, top_n: int = 20, include_system: bool = False) -> 
 
 @mcp.tool()
 def set_baseline(session_id: str) -> dict:
-    """Snapshot current hotspots as the comparison baseline."""
+    """Snapshot the top 100 current hotspots as the comparison baseline for a
+    later compare() call. Internally calls hotspots(top_n=100), so it needs a
+    completed record() first — same "call record_status() until done"
+    requirement, and it raises the same errors hotspots() would if no trace
+    exists yet.
+
+    Typical flow: record() -> poll record_status() -> set_baseline() ->
+    change or exercise the target -> record() again -> poll record_status()
+    -> compare(). Calling set_baseline() again overwrites the previous
+    baseline for this session.
+
+    Returns {baseline_symbols}."""
     s = _sess(session_id)
     s.baseline = hotspots(session_id, top_n=100)
     return {"baseline_symbols": len(s.baseline["hotspots"])}
@@ -827,8 +865,17 @@ def set_baseline(session_id: str) -> dict:
 
 @mcp.tool()
 def compare(session_id: str, threshold_pct: float = 1.0) -> dict:
-    """Diff hotspots against the baseline. Keyed on image!symbol, since two dylibs
-    can both export process()."""
+    """Diff the baseline set by set_baseline() against a fresh hotspots()
+    reading taken right now — so a new record()/record_status() cycle must
+    complete after set_baseline() and before calling this, or you're just
+    comparing the baseline against itself. Keyed on image!symbol, since two
+    dylibs can both export process(). Only symbols whose pct grew by at
+    least threshold_pct show up in `regressions`; a symbol missing from the
+    baseline is treated as 0.0 base_pct (a new hotspot, not just a bigger
+    one).
+
+    Returns {threshold_pct, regressed, regressions: [{symbol, base_pct,
+    new_pct, delta}]} sorted by delta descending."""
     s = _sess(session_id)
     if not s.baseline:
         raise ValueError("no baseline. Call set_baseline() first.")
@@ -854,7 +901,12 @@ def leaks(session_id: str) -> dict:
     real backtraces, start the session with launch_session(path, ...,
     mem_debug=True) instead: it launches the target fresh with
     MallocStackLogging=1 already in its environment before the first
-    instruction runs."""
+    instruction runs.
+
+    Returns {count, bytes, tail} — tail is the last 3000 chars of `leaks`'
+    own output (entries + summary) with its trailing "Binary Images:" image
+    dump already stripped, since that dump is often hundreds of KB and never
+    useful here."""
     s = _sess(session_id)
     out = subprocess.run(["leaks", str(s.pid), "--list"],
                          capture_output=True, text=True).stdout
@@ -871,7 +923,13 @@ def leaks(session_id: str) -> dict:
 @mcp.tool()
 def verify(session_id: str) -> dict:
     """Re-check every snapshotted image against its recorded LC_UUID, and every
-    dSYM against its image. Run this if you suspect the symbols."""
+    dSYM against its image. Run this if you suspect the symbols.
+
+    Returns {images: [{image, session_uuid, snapshot_ok, on_disk_uuid,
+    rebuilt_since_open, dsym_matches}], all_ok}. rebuilt_since_open is a
+    heads-up, not itself a failure — the frozen snapshot is what
+    symbolication actually reads, so it's fine as long as snapshot_ok stays
+    true; system images are skipped entirely and never appear in `images`."""
     s = _sess(session_id)
     rows = []
     for i in s.images:
